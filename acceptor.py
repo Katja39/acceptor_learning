@@ -1,4 +1,3 @@
-import graphviz
 from collections import deque
 
 class Acceptor:
@@ -10,6 +9,7 @@ class Acceptor:
         self.q0 = 0                      # start state
         self.F = set()                   # accepting states
         self.next_state_id = 1           # helper for new state IDs
+        self.dead_state = None           # tracks the dead state once created
 
     def learn_word(self, word):
         """
@@ -18,7 +18,12 @@ class Acceptor:
         current = self.q0
         for ch in word:
             self.Sigma.add(ch)
-            if (current, ch) not in self.delta:
+            needs_new_edge = (current, ch) not in self.delta
+            # allow overriding a previous dead-state edge when learning new positive samples
+            if not needs_new_edge and self.dead_state is not None:
+                needs_new_edge = self.delta[(current, ch)] == self.dead_state
+
+            if needs_new_edge:
                 new_state = self.next_state_id
                 self.Q.add(new_state)
                 self.delta[(current, ch)] = new_state
@@ -42,34 +47,13 @@ class Acceptor:
         """
         Minimizes the automaton to a minimal DFA.
         The automaton is first made total (dead state added),
-        then minimized using Moore's partitioning algorithm.
+        then minimized using Hopcroft's algorithm.
         """
         # 1. Make the automaton total (add dead state if needed)
         self._make_total()
 
-        # 2. Partitioning (Moore's algorithm)
-        # Initial partition: accepting / non-accepting
-        partitions = []
-        accepting = {s for s in self.Q if s in self.F}
-        non_accepting = self.Q - accepting
-        if accepting:
-            partitions.append(accepting)
-        if non_accepting:
-            partitions.append(non_accepting)
-
-        while True:
-            new_partitions = []
-            for group in partitions:
-                # state -> tuple of partition indices of next states (for all symbols)
-                profiles = {}
-                for s in group:
-                    profile = tuple(self._partition_index(self.delta[(s, ch)], partitions)
-                                    for ch in sorted(self.Sigma))
-                    profiles.setdefault(profile, set()).add(s)
-                new_partitions.extend(profiles.values())
-            if len(new_partitions) == len(partitions):
-                break
-            partitions = new_partitions
+        # 2. Hopcroft partition refinement
+        partitions = self._hopcroft_partitions()
 
         # 3. Build new automaton from partitions
         self._build_from_partitions(partitions)
@@ -97,6 +81,7 @@ class Acceptor:
             dead = self.next_state_id
             self.Q.add(dead)
             self.next_state_id += 1
+        self.dead_state = dead
 
         for s in list(self.Q):
             for ch in self.Sigma:
@@ -130,13 +115,16 @@ class Acceptor:
         for idx, group in enumerate(partitions):
             rep = next(iter(group))
             for ch in sorted(self.Sigma):
-                target = self.delta[(rep, ch)]
-                new_delta[(idx, ch)] = mapping[target]
+                if (rep, ch) in self.delta:
+                    target = self.delta[(rep, ch)]
+                    new_delta[(idx, ch)] = mapping[target]
 
         self.Q = new_Q
         self.delta = new_delta
         self.q0 = new_q0
         self.F = new_F
+        # the dead state (if any) may have merged; recompute handle
+        self.dead_state = None
 
     def _remove_unreachable(self):
         """
@@ -164,61 +152,51 @@ class Acceptor:
                 if s in reachable and t in reachable:
                     new_delta[(s, ch)] = t
             self.delta = new_delta
+            # if dead state was removed, clear handle
+            if self.dead_state not in self.Q:
+                self.dead_state = None
 
-    def visualize(self, filename="acceptor"):
+    @staticmethod
+    def _same_partitions(p_new, p_old):
         """
-        Generates a graphical representation of the automaton (only reachable states).
+        Compare two partitions disregarding ordering of groups.
         """
-        dot = graphviz.Digraph(comment='Automaton')
-        dot.attr(rankdir='LR')
+        if len(p_new) != len(p_old):
+            return False
+        old_sets = [frozenset(g) for g in p_old]
+        return all(frozenset(g) in old_sets for g in p_new)
 
-        # Start arrow
-        dot.node('start', '', shape='none')
-        dot.edge('start', f"s{self.q0}")
+    def _hopcroft_partitions(self):
+        """
+        Hopcroft's DFA minimization partition refinement.
+        Assumes DFA is total.
+        """
+        alphabet = sorted(self.Sigma)
+        F = set(self.F)
+        NF = self.Q - F
+        partitions = [F, NF] if NF else [F]
+        # remove empties
+        partitions = [p for p in partitions if p]
 
-        for state in self.Q:
-            name = f"s{state}"
-            if state in self.F:
-                dot.node(name, name, shape='doublecircle')
-            else:
-                dot.node(name, name, shape='circle')
+        waiting = partitions.copy()
+        while waiting:
+            A = waiting.pop()
+            for c in alphabet:
+                # states that transition via c into A
+                X = {q for q in self.Q if (q, c) in self.delta and self.delta[(q, c)] in A}
+                new_partitions = []
+                for Y in partitions:
+                    inter = Y & X
+                    diff = Y - X
+                    if inter and diff:
+                        new_partitions.extend([inter, diff])
+                        if Y in waiting:
+                            waiting.remove(Y)
+                            waiting.extend([inter, diff])
+                        else:
+                            waiting.append(inter if len(inter) <= len(diff) else diff)
+                    else:
+                        new_partitions.append(Y)
+                partitions = new_partitions
+        return partitions
 
-        for (state, char), next_state in self.delta.items():
-            if state in self.Q and next_state in self.Q:
-                dot.edge(f"s{state}", f"s{next_state}", label=char)
-
-        dot.render(filename, format='png', view=True, cleanup=True)
-        print(f"Graph saved and opened as {filename}.png")
-
-
-if __name__ == "__main__":
-    learner = Acceptor()
-
-    #Example
-    training_words = ["ab", "aba", "bb", "bba", "abb", "ba"]
-
-    print("--- Learning phase ---")
-    for word in training_words:
-        learner.learn_word(word)
-        learner.minimize()
-        print(f"Word '{word}' learned.")
-
-    print("\n--- Formal Representation ---")
-    print(f"State set Q: {[f's{s}' for s in sorted(learner.Q)]}")
-    print(f"Start state q0: s{learner.q0}")
-    print(f"Accepting states F: {[f's{s}' for s in sorted(learner.F)]}")
-
-    print("Transition function delta:")
-    for (state, char), target in sorted(learner.delta.items()):
-        print(f"  delta(s{state}, '{char}') = s{target}")
-
-    print("\n--- Test phase ---")
-    test_words = ["ab", "aba", "a", "bb", "b", "bbaa", "xyz"]
-
-    for word in test_words:
-        if learner.accepts(word):
-            print(f"The word '{word}' BELONGS to the language.")
-        else:
-            print(f"The word '{word}' does NOT belong to the language.")
-
-    learner.visualize("learned_acceptor")
