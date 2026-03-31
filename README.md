@@ -10,8 +10,8 @@ The tool implements an iterative learning strategy for acceptors (DFAs):
 3. **Generalizes** optionally using heuristics (suffix, prefix, substring)
 4. **Tests** arbitrary words against the learned hypothesis
 
-acceptor.py   # Core DFA class
-app.py        # Streamlit frontend
+- **acceptor.py**   Core DFA class
+- **app.py**        Streamlit frontend
 
 ## Requirements
 

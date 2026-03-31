@@ -18,6 +18,7 @@ def to_graph(automaton: Acceptor) -> graphviz.Digraph:
     """Create a Graphviz graph for the current automaton state."""
     dot = graphviz.Digraph(comment="Automaton")
     dot.attr(rankdir="LR")
+    dot.attr(ordering="out")
 
     label_map = build_label_map(automaton)
 
@@ -29,7 +30,14 @@ def to_graph(automaton: Acceptor) -> graphviz.Digraph:
         shape = "doublecircle" if state in automaton.F else "circle"
         dot.node(name, name, shape=shape)
 
-    for (state, target), chars in merge_transitions(automaton).items():
+    merged = merge_transitions(automaton)
+    for (state, target), chars in sorted(
+        merged.items(),
+        key=lambda item: (
+            int(label_map[item[0][0]][1:]),
+            int(label_map[item[0][1]][1:]),
+        ),
+    ):
         if state in automaton.Q and target in automaton.Q:
             label = ",".join(sorted(chars))
             dot.edge(label_map[state], label_map[target], label=label)
@@ -42,7 +50,14 @@ def transitions_to_lines(automaton: Acceptor, label_map: dict[int, str]) -> list
     Return transitions
     """
     lines = []
-    for (state, target), chars in merge_transitions(automaton).items():
+    merged = merge_transitions(automaton)
+    for (state, target), chars in sorted(
+        merged.items(),
+        key=lambda item: (
+            int(label_map[item[0][0]][1:]),
+            int(label_map[item[0][1]][1:]),
+        ),
+    ):
         if state in automaton.Q and target in automaton.Q:
             label = ",".join(sorted(chars))
             lines.append(f"{label_map[state]} --{label}--> {label_map[target]}")
@@ -122,7 +137,12 @@ def choose_generalization(words: list[str]) -> tuple[str, str] | None:
     Returns (mode, token) or None for 'exact'.
     Tie‑break priority: suffix > prefix > contains, with longer token preferred.
     """
-    if not words or any(len(w) == 0 for w in words):
+    # Heuristics only kick in with at least two non-empty examples
+    if len(words) < 2 or any(len(w) == 0 for w in words):
+        return None
+
+    # Repeatedly seeing exactly the same word should stay exact
+    if len(set(words)) == 1:
         return None
 
     suffix = longest_common_suffix(words)
@@ -153,7 +173,7 @@ def describe_language(words: list[str], generalized: bool) -> tuple[str, str, st
     if not words:
         return "∅", "", "empty"
     examples = "; ".join(words[:6]) + ("; …" if len(words) > 6 else "")
-    if generalized and not any(len(w) == 0 for w in words):
+    if generalized and len(words) >= 2 and not any(len(w) == 0 for w in words):
         choice = choose_generalization(words)
         if choice:
             mode, token = choice
@@ -287,10 +307,9 @@ def build_generalized_acceptor(words: list[str], generalize: bool) -> Acceptor:
     exact.minimize()
     ensure_total(exact)
 
-    if not generalize or not words:
+    if not generalize or not words or len(words) < 2:
         return exact
 
-    # allow generalization even mit nur einem Wort (mehr Akzeptanz)
     if any(len(w) == 0 for w in words):
         return exact
 
@@ -377,17 +396,79 @@ def ensure_total(automaton: Acceptor) -> Acceptor:
 
 def build_label_map(automaton: Acceptor) -> dict[int, str]:
     """
-    Map internal state ids to ascending labels
-    Start state is always z0, remaining states follow numeric order.
+    Map internal state ids to display labels z0, z1, ...
+    Uses BFS from the start state so nearby states get small numbers
+    (only affects visualization, not the automaton itself).
     """
     label_map = {automaton.q0: "z0"}
     counter = 1
+    seen = {automaton.q0}
+    queue = [automaton.q0]
+    sigma = sorted(automaton.Sigma)
+    while queue:
+        s = queue.pop(0)
+        for ch in sigma:
+            t = automaton.delta.get((s, ch))
+            if t is None or t in seen:
+                continue
+            label_map[t] = f"z{counter}"
+            counter += 1
+            seen.add(t)
+            queue.append(t)
+    # fallback for any unreachable states (should not occur after minimize)
     for s in sorted(automaton.Q):
-        if s == automaton.q0:
-            continue
-        label_map[s] = f"z{counter}"
-        counter += 1
+        if s not in label_map:
+            label_map[s] = f"z{counter}"
+            counter += 1
     return label_map
+
+
+def build_step_explanation(snap: dict, step: int) -> list[str]:
+    """
+    Build a concise explanation of what the learner actually does in this step.
+    """
+    steps = []
+
+    def add(desc: str):
+        steps.append(f"{len(steps)+1}. {desc}")
+
+    reused = snap.get("reused_prev")
+    mode = snap.get("lang_mode")
+    mode_label = {
+        "suffix": "Suffix-Hypothese (\u03a3* \u00b7 t)",
+        "prefix": "Pr\u00e4fix-Hypothese (t \u00b7 \u03a3*)",
+        "contains": "Teilstring-Hypothese (\u03a3* \u00b7 t \u00b7 \u03a3*)",
+        "exact": "exakte Hypothese",
+    }.get(mode, "Hypothese")
+
+    add(f"Nimm neues Beispiel w_{step} = `{snap['word']}` in die bisherige Beispielsammlung auf.")
+
+    if step == 1:
+        if mode == "exact":
+            add("Baue H_1 neu aus V_1: Lerne das Wort als Präfixbaum mit akzeptierendem Endzustand.")
+            add("Minimiere H_1 und ergänze fehlende Übergänge über den Dead-State.")
+        else:
+            add(f"Baue H_1 neu aus V_1: Bestimme ein Muster t und konstruiere daraus direkt ein DFA als {mode_label}.")
+            add("Ergänze ggf. fehlende Übergänge, damit H_1 vollständig ist.")
+
+        add(f"Prüfe w_{step} in H_{step} -> Ergebnis: {'akzeptiert' if snap.get('accepted') else 'nicht akzeptiert'}.")
+        return steps
+
+    add(f"Prüfe, ob H_{step-1} das neue Beispiel bereits akzeptiert -> Ergebnis: {'positiv' if reused else 'negativ'}.")
+
+    if reused:
+        add(f"Setze H_{step} = H_{step-1} -> die Hypothese bleibt unverändert.")
+        return steps
+
+    if mode == "exact":
+        add(f"Baue H_{step} neu aus allen bisherigen Beispielen V_{step}: Lerne den Präfixbaum und markiere die Endzustände akzeptierend.")
+        add(f"Minimiere H_{step} und ergänze fehlende Übergänge über den Dead-State.")
+    else:
+        add(f"Baue H_{step} neu aus allen bisherigen Beispielen V_{step}: Bestimme ein gemeinsames Muster t und konstruiere daraus direkt ein DFA als {mode_label}.")
+        add(f"Ergänze ggf. fehlende Übergänge, damit H_{step} vollständig ist.")
+
+    add(f"Prüfe w_{step} in H_{step} -> Ergebnis: {'akzeptiert' if snap.get('accepted') else 'nicht akzeptiert'}.")
+    return steps
 
 
 st.set_page_config(page_title="Lernen von Akzeptoren", layout="wide")
@@ -420,9 +501,14 @@ if "snapshots" not in st.session_state:
     st.session_state.snapshots = []
 if "acceptor" not in st.session_state:
     st.session_state.acceptor = None
+if "has_trained" not in st.session_state:
+    st.session_state.has_trained = False
 
 # --- Training -----------------------------------------------------------------
-recompute = run_training or st.session_state.get("generalize_toggle_changed", False)
+recompute = run_training or (
+    st.session_state.get("generalize_toggle_changed", False)
+    and st.session_state.get("has_trained", False)
+)
 if recompute:
     words = parse_words(training_raw)
     if not words:
@@ -437,32 +523,93 @@ if recompute:
             snapshots = []
             prev_model = None
             for idx in range(1, len(words) + 1):
-                learner = build_generalized_acceptor(words[:idx], generalize)
-                labels = build_label_map(learner)
-                transitions = transitions_to_lines(learner, labels)
-                word = words[idx - 1]
-                trace_lines, accepted = build_trace(learner, labels, word)
+                observed = words[:idx]
+                word = observed[-1]
+                sigma = {ch for w in observed for ch in w}
+
                 prev_accepts = prev_model.accepts(word) if prev_model else None
-                changed = True if prev_model is None else not models_equal(prev_model, learner)
-                prev_states = len(prev_model.Q) if prev_model else None
-                prev_edges = len(prev_model.delta) if prev_model else None
-                curr_states = len(learner.Q)
-                curr_edges = len(learner.delta)
-                dead = learner.dead_state
-                dead_incoming = False
-                if dead is not None:
-                    dead_incoming = any(
-                        s != dead and t == dead for (s, ch), t in learner.delta.items()
+                reuse_prev = prev_accepts is True and prev_model is not None
+
+                learner = None
+                lang_mode = "exact"
+
+                if reuse_prev:
+                    learner = prev_model
+                    # reuse previous snapshot metadata to avoid rebuilding
+                    prev_snap = snapshots[-1]
+                    labels = prev_snap["label_map"]
+                    transitions = prev_snap["transitions"]
+                    graph_obj = prev_snap["graph"]
+                    lang_desc = prev_snap["language"]
+                    lang_examples = prev_snap.get("examples", "")
+                    lang_mode = prev_snap.get("lang_mode", "exact")
+                    dead_incoming = prev_snap.get("dead_incoming", False)
+                    curr_states = prev_states = len(learner.Q)
+                    curr_edges = prev_edges = len(learner.delta)
+                    changed = False
+                else:
+                    choice = (
+                        choose_generalization(observed)
+                        if generalize
+                        and len(observed) >= 2
+                        and not any(len(w) == 0 for w in observed)
+                        else None
                     )
-                lang_desc, lang_examples, lang_mode = describe_language(words[:idx], generalize)
+                    if generalize and choice:
+                        mode, token = choice
+                        lang_mode = mode
+                        if mode == "suffix":
+                            learner = build_suffix_dfa(sigma, token)
+                        elif mode == "prefix":
+                            learner = build_prefix_dfa(sigma, token)
+                        elif mode == "contains":
+                            learner = build_contains_dfa(sigma, token)
+
+                    if learner is None:
+                        learner = Acceptor()
+                        for w in observed:
+                            learner.learn_word(w)
+                        learner.Sigma = sigma
+                        learner.minimize()
+                        ensure_total(learner)
+                        lang_mode = "exact"
+
+                    labels = build_label_map(learner)
+                    transitions = transitions_to_lines(learner, labels)
+                    graph_obj = to_graph(learner)
+                    curr_states = len(learner.Q)
+                    curr_edges = len(learner.delta)
+                    prev_states = len(prev_model.Q) if prev_model else None
+                    prev_edges = len(prev_model.delta) if prev_model else None
+                    changed = True if prev_model is None else not models_equal(prev_model, learner)
+                    dead = learner.dead_state
+                    dead_incoming = False
+                    if dead is not None:
+                        dead_incoming = any(
+                            s != dead and t == dead for (s, ch), t in learner.delta.items()
+                        )
+                    lang_desc, lang_examples, _ = describe_language(observed, generalize)
+
+                trace_lines, accepted = build_trace(learner, labels, word)
                 snapshots.append(
                     {
                         "step": idx,
+                        "model": copy.deepcopy(learner),
                         "word": word,
-                        "graph": to_graph(learner),
-                        "states": [labels[learner.q0]]
-                        + [labels[s] for s in sorted(learner.Q) if s != learner.q0],
-                        "accepting": [labels[s] for s in sorted(learner.F)],
+                        "graph": graph_obj,
+                        "label_map": labels,
+                        "states": [
+                            lbl
+                            for _, lbl in sorted(
+                                labels.items(), key=lambda item: int(item[1][1:])
+                            )
+                        ],
+                        "accepting": [
+                            labels[s]
+                            for s in sorted(
+                                learner.F, key=lambda st: int(labels[st][1:])
+                            )
+                        ],
                         "alphabet": sorted(learner.Sigma),
                         "start": labels[learner.q0],
                         "transitions": transitions,
@@ -472,6 +619,7 @@ if recompute:
                         "lang_mode": lang_mode,
                         "examples": lang_examples,
                         "generalize": generalize,
+                        "reused_prev": reuse_prev,
                         "prev_accepts": prev_accepts,
                         "changed": changed,
                         "prev_states": prev_states,
@@ -482,10 +630,11 @@ if recompute:
                     }
                 )
                 prev_model = learner
-            final_model = build_generalized_acceptor(words, generalize)
+            final_model = prev_model
 
             st.session_state.acceptor = final_model
             st.session_state.snapshots = snapshots
+            st.session_state.has_trained = True
             st.success(f"{len(words)} Wörter gelernt und DEA minimiert.")
         except Exception as exc:
             st.session_state.acceptor = None
@@ -507,34 +656,83 @@ if snapshots:
     snap = snapshots[step - 1]
     with st.expander("Was passiert in diesem Schritt?"):
         steps_descr = []
-        steps_descr.append(f"1. Neues Wort `{snap['word']}` wird gegen Hypothese H{step-1 if step>1 else 0} getestet.")
-        if step == 1:
-            steps_descr.append("2. Start mit leerem Akzeptor: Pfad des Wortes wird als Präfix-Baum angelegt.")
-        else:
-            prev_accepts = snap.get("prev_accepts")
-            if prev_accepts:
-                steps_descr.append("2. Ergebnis: wird bereits akzeptiert.")
-                if snap.get("changed") is False:
-                    steps_descr.append("Keine weiteren Aktionen nötig (Hypothese bleibt unverändert).")
-                else:
-                    steps_descr.append("3. Minimierung fasst Äquivalenzklassen zusammen; Sprache bleibt gleich.")
+
+        def add(desc: str):
+            steps_descr.append(f"{len(steps_descr)+1}. {desc}")
+
+        add(
+            f"Neues Beispiel w_{step} = `{snap['word']}` wird hinzugefügt."
+        )
+
+        reused = snap.get("reused_prev")
+        stop_after_hypothesis_check = step > 1 and reused
+        if step > 1:
+            if reused:
+                add(
+                    f"Pr\u00fcfung gegen Hypothese H_{step-1}: Akzeptiert, Hypothese muss nicht ge\u00e4ndert werden."
+                )
             else:
-                steps_descr.append("2. Ergebnis: wird NICHT akzeptiert.")
-                steps_descr.append("3. Fehlende Pfade werden als Präfix-Baum ergänzt (neue Zustände/Kanten).")
+                add(
+                    f"Pr\u00fcfung gegen Hypothese H_{step-1}: Nicht akzeptiert, Hypothese muss bearbeitet werden."
+                )
+
+        mode = snap.get("lang_mode")
+        mode_label = {
+            "suffix": "Heuristik: gemeinsamer Suffix (\u03a3* \u00b7 t)",
+            "prefix": "Heuristik: gemeinsamer Pr\u00e4fix (t \u00b7 \u03a3*)",
+            "contains": "Heuristik: gemeinsamer Teilstring (\u03a3* \u00b7 t \u00b7 \u03a3*)",
+            "exact": "Exakt: PTA -> Minimierung (keine Generalisierung)",
+        }.get(mode, "Modus unbekannt")
+
+        if not stop_after_hypothesis_check and not reused:
+            base_update = "Start aus leerer Hypothese H0." if step == 1 else f"Update auf Basis der bisherigen Hypothese H_{step-1}."
+            if mode == "exact":
+                add(
+                    f"Hypothesenaufbau: {base_update} Pr\u00e4fixbaum (PTA) um w_{step} erweitern, Endknoten akzeptierend markieren, danach minimieren."
+                )
+            else:
+                add(
+                    f"Hypothesenaufbau: {base_update} Muster t (Suffix/Pr\u00e4fix/Teilstring) w\u00e4hlen und daraus ein DFA bauen; ggf. ersetzt H_{step} das vorige Diagramm."
+                )
+
+            add(
+                f"Minimierung/Komplettierung: Myhill-Nerode verschmilzt ununterscheidbare Zust\u00e4nde; fehlende \u00dcberg\u00e4nge gehen in den Dead-State. Ergebnis: H_{step} ({mode_label})."
+            )
+
+            if mode != "exact":
+                add(
+                    "Heuristische Verallgemeinerung aktiv: gemeinsamer Suffix/Pr\u00e4fix/Teilstring t definiert ein generelles DFA (\u03a3* \u00b7 t, t \u00b7 \u03a3* oder \u03a3* \u00b7 t \u00b7 \u03a3*)."
+                )
+
+        if not stop_after_hypothesis_check:
+            add(
+                f"Akzeptanzpr\u00fcfung: Pfad f\u00fcr w_{step} endet {'akzeptierend' if snap.get('accepted') else 'nicht akzeptierend'} (siehe rechts)."
+            )
+
+        if not stop_after_hypothesis_check and step > 1:
+            if snap.get("changed"):
+                add("Sprachvergleich: L(H_{step-1}) != L(H_{step}) -> Hypothese hat sich ge\u00e4ndert.")
+            else:
+                add("Sprachvergleich: L(H_{step-1}) = L(H_{step}) -> Hypothese unver\u00e4ndert \u00fcbernommen.")
+
         prev_states = snap.get("prev_states")
         prev_edges = snap.get("prev_edges")
         curr_states = snap.get("curr_states")
         curr_edges = snap.get("curr_edges")
-        if not snap.get("prev_accepts") or snap.get("changed"):
-            if prev_states is not None and (curr_states < prev_states or curr_edges < prev_edges):
-                steps_descr.append(f"4. Überprüfung Minimierung: verschmolz Zustände ({prev_states} → {curr_states}), Kanten ({prev_edges} → {curr_edges}).")
+        if not stop_after_hypothesis_check and prev_states is not None and prev_edges is not None:
+            if curr_states != prev_states or curr_edges != prev_edges:
+                add(
+                    f"Größe (Zustände/Kanten): {prev_states}/{prev_edges} -> {curr_states}/{curr_edges} nach Minimierung und Komplettierung."
+                )
             else:
-                steps_descr.append("4. Überprüfung Minimierung: keine weiteren Zusammenlegungen nötig.")
-            if snap.get("dead_incoming"):
-                steps_descr.append("5. Überprüfung Komplettierung: fehlende Übergänge ergänzt → Dead-State genutzt.")
-            else:
-                steps_descr.append("5. Überprüfung Komplettierung: keine fehlenden Übergänge gefunden (kein neuer Dead-State-Eingang).")
+                add("Größe: Zustände/Kanten unverändert nach Minimierung/Komplettierung.")
 
+        if not stop_after_hypothesis_check and snap.get("dead_incoming"):
+            add("Dead-State hat eingehende Kante -> zeigt Stellen, an denen Eingaben ins Nirwana laufen.")
+        elif not stop_after_hypothesis_check:
+            add("Kein eingehender Dead-State -> alle Transitionen bleiben im Kern-Automaten.")
+
+        steps_descr = build_step_explanation(snap, step)
         st.markdown("\n".join(steps_descr))
 
     col_graph, col_last, col_sig = st.columns([2, 1, 1])
@@ -542,7 +740,14 @@ if snapshots:
         st.markdown(f"**Hypothese {snap['step']}**")
         st.graphviz_chart(snap["graph"])
         with st.expander("Diagramm in Textform"):
-            st.code("\n".join(snap["transitions"]), language="text")
+            text_lines = [
+                f"Startzustand: {snap['start']}",
+                f"Akzeptierende Zustände: {', '.join(snap['accepting']) if snap['accepting'] else 'keine'}",
+                "",
+                "Übergänge:",
+                *snap["transitions"],
+            ]
+            st.code("\n".join(text_lines), language="text")
     with col_last:
         st.write(f"Letztes Wort: `{snap['word']}`")
         st.markdown("**Pfad**")
@@ -556,8 +761,6 @@ if snapshots:
             st.write(f"V_{step} = {{{'; '.join(observed_words)}}}")
         else:
             st.write("V = ∅")
-        if example_str:
-            st.caption(f"Beispiele: {example_str}")
         st.write(f"𝔄 = (Σ, Z, δ, F, z₀)")
         st.write(f"Σ = {{{', '.join(snap['alphabet'])}}}")
         st.write(f"Z = {{{', '.join(snap['states'])}}}")
@@ -575,15 +778,18 @@ if snapshots:
 
 # --- Tests --------------------------------------------------------------------
 st.subheader("Testen")
+if snapshots:
+    st.caption(f"Getestet wird gegen die aktuell ausgewählte Hypothese H_{step}.")
+
 test_raw = st.text_area(
     "Testwörter",
     value="",
     height=160,
 )
-run_tests = st.button("Akzeptanz prüfen")
+run_tests = st.button("Prüfen")
 
 if run_tests:
-    tester = st.session_state.acceptor
+    tester = snapshots[step - 1]["model"] if snapshots else st.session_state.acceptor
     if tester is None:
         st.error("Bitte zuerst trainieren (oben auf 'Lernen & minimieren').")
     else:
@@ -607,5 +813,5 @@ if run_tests:
 # --- Help ------------------------------------------------------------------
 st.caption(
     "Tipp: Starte das Frontend mit `streamlit run app.py`. "
-    "Die Graphviz-Ausgabe benoetigt eine funktionierende Graphviz-Installation."
+    "Die Graphviz-Ausgabe benötigt eine funktionierende Graphviz-Installation."
 )
