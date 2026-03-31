@@ -18,10 +18,12 @@ The tool implements an iterative learning strategy for acceptors (DFAs):
 - Python 3.10+
 - [Graphviz](https://graphviz.org/download/) installed on your system
 
-Install Python dependencies:
+Run the project inside a virtual environment and install the dependencies from `requirements.txt`:
 
 ```bash
-pip install streamlit graphviz pandas
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
 ## Getting Started
@@ -31,6 +33,8 @@ streamlit run app.py
 ```
 
 Then open your browser at `http://localhost:8501`.
+
+> Note: The project is intended to be run from an activated virtual environment.
 
 ## Usage
 

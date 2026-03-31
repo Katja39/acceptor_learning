@@ -288,46 +288,6 @@ def build_contains_dfa(sigma: set[str], pattern: str) -> Acceptor:
     return ensure_total(gen)
 
 
-def build_generalized_acceptor(words: list[str], generalize: bool) -> Acceptor:
-    """
-    Build either the exact DEA (prefix tree + minimization) or a generalized DEA.
-    Heuristics:
-    - längster gemeinsamer Suffix (>=1): akzeptiere Σ*·Suffix
-    - längster gemeinsamer Präfix (>=1): akzeptiere Präfix·Σ*
-    - längster gemeinsamer Teilstring (>=2): akzeptiere Σ*·Teilstring·Σ*
-    - sonst: exakte Minimierung
-    """
-    sigma = {ch for w in words for ch in w}
-
-    # exact model
-    exact = Acceptor()
-    for w in words:
-        exact.learn_word(w)
-    exact.Sigma = sigma
-    exact.minimize()
-    ensure_total(exact)
-
-    if not generalize or not words or len(words) < 2:
-        return exact
-
-    if any(len(w) == 0 for w in words):
-        return exact
-
-    choice = choose_generalization(words)
-    if not choice:
-        return exact
-
-    mode, token = choice
-    if mode == "suffix":
-        return build_suffix_dfa(sigma, token)
-    if mode == "prefix":
-        return build_prefix_dfa(sigma, token)
-    if mode == "contains":
-        return build_contains_dfa(sigma, token)
-
-    return exact
-
-
 def models_equal(a: Acceptor, b: Acceptor) -> bool:
     """
     Language equivalence check for two DFAs (state ids may differ).
@@ -499,8 +459,6 @@ with col_chk:
 # --- Session State ------------------------------------------------------------
 if "snapshots" not in st.session_state:
     st.session_state.snapshots = []
-if "acceptor" not in st.session_state:
-    st.session_state.acceptor = None
 if "has_trained" not in st.session_state:
     st.session_state.has_trained = False
 
@@ -514,7 +472,6 @@ if recompute:
     if not words:
         st.warning("Bitte mindestens ein Trainingswort eingeben.")
     elif len(words) < 2:
-        st.session_state.acceptor = None
         st.session_state.snapshots = []
         st.error("Bitte mindestens zwei Wörter eingeben, damit der Akzeptor gelernt werden kann.")
     else:
@@ -620,7 +577,6 @@ if recompute:
                         "examples": lang_examples,
                         "generalize": generalize,
                         "reused_prev": reuse_prev,
-                        "prev_accepts": prev_accepts,
                         "changed": changed,
                         "prev_states": prev_states,
                         "prev_edges": prev_edges,
@@ -630,14 +586,11 @@ if recompute:
                     }
                 )
                 prev_model = learner
-            final_model = prev_model
 
-            st.session_state.acceptor = final_model
             st.session_state.snapshots = snapshots
             st.session_state.has_trained = True
             st.success(f"{len(words)} Wörter gelernt und DEA minimiert.")
         except Exception as exc:
-            st.session_state.acceptor = None
             st.session_state.snapshots = []
             st.error(f"Fehler beim Lernen: {exc}")
 st.session_state["generalize_toggle_changed"] = False
@@ -655,83 +608,6 @@ if snapshots:
     )
     snap = snapshots[step - 1]
     with st.expander("Was passiert in diesem Schritt?"):
-        steps_descr = []
-
-        def add(desc: str):
-            steps_descr.append(f"{len(steps_descr)+1}. {desc}")
-
-        add(
-            f"Neues Beispiel w_{step} = `{snap['word']}` wird hinzugefügt."
-        )
-
-        reused = snap.get("reused_prev")
-        stop_after_hypothesis_check = step > 1 and reused
-        if step > 1:
-            if reused:
-                add(
-                    f"Pr\u00fcfung gegen Hypothese H_{step-1}: Akzeptiert, Hypothese muss nicht ge\u00e4ndert werden."
-                )
-            else:
-                add(
-                    f"Pr\u00fcfung gegen Hypothese H_{step-1}: Nicht akzeptiert, Hypothese muss bearbeitet werden."
-                )
-
-        mode = snap.get("lang_mode")
-        mode_label = {
-            "suffix": "Heuristik: gemeinsamer Suffix (\u03a3* \u00b7 t)",
-            "prefix": "Heuristik: gemeinsamer Pr\u00e4fix (t \u00b7 \u03a3*)",
-            "contains": "Heuristik: gemeinsamer Teilstring (\u03a3* \u00b7 t \u00b7 \u03a3*)",
-            "exact": "Exakt: PTA -> Minimierung (keine Generalisierung)",
-        }.get(mode, "Modus unbekannt")
-
-        if not stop_after_hypothesis_check and not reused:
-            base_update = "Start aus leerer Hypothese H0." if step == 1 else f"Update auf Basis der bisherigen Hypothese H_{step-1}."
-            if mode == "exact":
-                add(
-                    f"Hypothesenaufbau: {base_update} Pr\u00e4fixbaum (PTA) um w_{step} erweitern, Endknoten akzeptierend markieren, danach minimieren."
-                )
-            else:
-                add(
-                    f"Hypothesenaufbau: {base_update} Muster t (Suffix/Pr\u00e4fix/Teilstring) w\u00e4hlen und daraus ein DFA bauen; ggf. ersetzt H_{step} das vorige Diagramm."
-                )
-
-            add(
-                f"Minimierung/Komplettierung: Myhill-Nerode verschmilzt ununterscheidbare Zust\u00e4nde; fehlende \u00dcberg\u00e4nge gehen in den Dead-State. Ergebnis: H_{step} ({mode_label})."
-            )
-
-            if mode != "exact":
-                add(
-                    "Heuristische Verallgemeinerung aktiv: gemeinsamer Suffix/Pr\u00e4fix/Teilstring t definiert ein generelles DFA (\u03a3* \u00b7 t, t \u00b7 \u03a3* oder \u03a3* \u00b7 t \u00b7 \u03a3*)."
-                )
-
-        if not stop_after_hypothesis_check:
-            add(
-                f"Akzeptanzpr\u00fcfung: Pfad f\u00fcr w_{step} endet {'akzeptierend' if snap.get('accepted') else 'nicht akzeptierend'} (siehe rechts)."
-            )
-
-        if not stop_after_hypothesis_check and step > 1:
-            if snap.get("changed"):
-                add("Sprachvergleich: L(H_{step-1}) != L(H_{step}) -> Hypothese hat sich ge\u00e4ndert.")
-            else:
-                add("Sprachvergleich: L(H_{step-1}) = L(H_{step}) -> Hypothese unver\u00e4ndert \u00fcbernommen.")
-
-        prev_states = snap.get("prev_states")
-        prev_edges = snap.get("prev_edges")
-        curr_states = snap.get("curr_states")
-        curr_edges = snap.get("curr_edges")
-        if not stop_after_hypothesis_check and prev_states is not None and prev_edges is not None:
-            if curr_states != prev_states or curr_edges != prev_edges:
-                add(
-                    f"Größe (Zustände/Kanten): {prev_states}/{prev_edges} -> {curr_states}/{curr_edges} nach Minimierung und Komplettierung."
-                )
-            else:
-                add("Größe: Zustände/Kanten unverändert nach Minimierung/Komplettierung.")
-
-        if not stop_after_hypothesis_check and snap.get("dead_incoming"):
-            add("Dead-State hat eingehende Kante -> zeigt Stellen, an denen Eingaben ins Nirwana laufen.")
-        elif not stop_after_hypothesis_check:
-            add("Kein eingehender Dead-State -> alle Transitionen bleiben im Kern-Automaten.")
-
         steps_descr = build_step_explanation(snap, step)
         st.markdown("\n".join(steps_descr))
 
@@ -789,7 +665,7 @@ test_raw = st.text_area(
 run_tests = st.button("Prüfen")
 
 if run_tests:
-    tester = snapshots[step - 1]["model"] if snapshots else st.session_state.acceptor
+    tester = snapshots[step - 1]["model"] if snapshots else None
     if tester is None:
         st.error("Bitte zuerst trainieren (oben auf 'Lernen & minimieren').")
     else:

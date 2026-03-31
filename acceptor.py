@@ -98,15 +98,6 @@ class Acceptor:
         for ch in self.Sigma:
             self.delta[(dead, ch)] = dead
 
-    def _partition_index(self, state, partitions):
-        """
-        Returns the index of the partition containing the state.
-        """
-        for i, group in enumerate(partitions):
-            if state in group:
-                return i
-        raise ValueError(f"State {state} not found in partitions")
-
     def _build_from_partitions(self, partitions):
         """
         Builds a new automaton where each partition is a state.
@@ -163,16 +154,6 @@ class Acceptor:
             # if dead state was removed, clear handle
             if self.dead_state not in self.Q:
                 self.dead_state = None
-
-    @staticmethod
-    def _same_partitions(p_new, p_old):
-        """
-        Compare two partitions disregarding ordering of groups.
-        """
-        if len(p_new) != len(p_old):
-            return False
-        old_sets = [frozenset(g) for g in p_old]
-        return all(frozenset(g) in old_sets for g in p_new)
 
     def _hopcroft_partitions(self):
         """
