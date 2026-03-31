@@ -216,7 +216,7 @@ def build_prefix_dfa(sigma: set[str], prefix: str) -> Acceptor:
 
 
 def build_suffix_dfa(sigma: set[str], suffix: str) -> Acceptor:
-    """Accepts all words that end with the given suffix (KMP-style automaton)."""
+    """Accepts all words that end with the given suffix."""
     m = len(suffix)
     gen = Acceptor()
     gen.Q = set(range(m + 1))
@@ -470,6 +470,8 @@ recompute = run_training or (
 if recompute:
     words = parse_words(training_raw)
     if not words:
+        st.session_state.snapshots = []
+        st.session_state.training_words = []
         st.warning("Bitte mindestens ein Trainingswort eingeben.")
     elif len(words) < 2:
         st.session_state.snapshots = []
