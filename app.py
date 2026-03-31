@@ -1,6 +1,8 @@
 import graphviz
 import streamlit as st
 import pandas as pd
+import copy
+from collections import deque
 
 from acceptor import Acceptor
 
@@ -73,13 +75,209 @@ def build_trace(automaton: Acceptor, label_map: dict[int, str], word: str):
     return lines, state in automaton.F
 
 
+def longest_common_prefix(words: list[str]) -> str:
+    if not words:
+        return ""
+    prefix = words[0]
+    for w in words[1:]:
+        while not w.startswith(prefix) and prefix:
+            prefix = prefix[:-1]
+        if not prefix:
+            break
+    return prefix
+
+
+def longest_common_suffix(words: list[str]) -> str:
+    if not words:
+        return ""
+    suffix = words[0]
+    for w in words[1:]:
+        while not w.endswith(suffix) and suffix:
+            suffix = suffix[1:]
+        if not suffix:
+            break
+    return suffix
+
+
+def longest_common_substring(words: list[str]) -> str:
+    """
+    Longest contiguous substring shared by all words.
+    Brute-force over the shortest word; fine for small classroom examples.
+    """
+    if not words:
+        return ""
+    shortest = min(words, key=len)
+    n = len(shortest)
+    for length in range(n, 0, -1):
+        for start in range(n - length + 1):
+            cand = shortest[start : start + length]
+            if all(cand in w for w in words):
+                return cand
+    return ""
+
+
+def choose_generalization(words: list[str]) -> tuple[str, str] | None:
+    """
+    Decide which simple heuristic to use (suffix / prefix / contains substring).
+    Returns (mode, token) or None for 'exact'.
+    Tie‑break priority: suffix > prefix > contains, with longer token preferred.
+    """
+    if not words or any(len(w) == 0 for w in words):
+        return None
+
+    suffix = longest_common_suffix(words)
+    prefix = longest_common_prefix(words)
+    substring = longest_common_substring(words)
+
+    candidates = []
+    if suffix:
+        candidates.append(("suffix", suffix))
+    if prefix:
+        candidates.append(("prefix", prefix))
+    if substring and len(substring) >= 2:
+        candidates.append(("contains", substring))
+
+    if not candidates:
+        return None
+
+    priority = {"suffix": 2, "prefix": 1, "contains": 0}
+    return max(candidates, key=lambda c: (len(c[1]), priority[c[0]]))
+
+
+def describe_language(words: list[str], generalized: bool) -> tuple[str, str, str]:
+    """
+    Provide a short language description plus a compact example list.
+    Mirrors the generalization heuristic: prefer suffix, else prefix,
+    else contains-substring, otherwise stick to the listed samples.
+    """
+    if not words:
+        return "∅", "", "empty"
+    examples = "; ".join(words[:6]) + ("; …" if len(words) > 6 else "")
+    if generalized and not any(len(w) == 0 for w in words):
+        choice = choose_generalization(words)
+        if choice:
+            mode, token = choice
+            if mode == "suffix":
+                return f"Σ*·{token}", examples, "suffix"
+            if mode == "prefix":
+                return f"{token}·Σ*", examples, "prefix"
+            if mode == "contains":
+                return f"Σ*·{token}·Σ*", examples, "contains"
+    return "{" + "; ".join(words) + "}", examples, "exact"
+
+
+def build_prefix_dfa(sigma: set[str], prefix: str) -> Acceptor:
+    """Accepts all words that start with the given prefix."""
+    m = len(prefix)
+    dead = m + 1
+    gen = Acceptor()
+    gen.Q = set(range(m + 2))
+    gen.q0 = 0
+    gen.F = {m}
+    gen.Sigma = set(sigma) | set(prefix)
+    gen.delta = {}
+
+    for state in range(m):
+        expected = prefix[state]
+        for ch in gen.Sigma:
+            if ch == expected:
+                gen.delta[(state, ch)] = state + 1
+            else:
+                gen.delta[(state, ch)] = dead
+    # accepting state: loop on everything
+    for ch in gen.Sigma:
+        gen.delta[(m, ch)] = m
+    # dead state: self-loop
+    for ch in gen.Sigma:
+        gen.delta[(dead, ch)] = dead
+
+    gen.next_state_id = dead + 1
+    return ensure_total(gen)
+
+
+def build_suffix_dfa(sigma: set[str], suffix: str) -> Acceptor:
+    """Accepts all words that end with the given suffix (KMP-style automaton)."""
+    m = len(suffix)
+    gen = Acceptor()
+    gen.Q = set(range(m + 1))
+    gen.q0 = 0
+    gen.F = {m}
+    gen.Sigma = set(sigma) | set(suffix)
+    gen.delta = {}
+
+    # prefix function for KMP
+    pi = [0] * m
+    k = 0
+    for i in range(1, m):
+        while k > 0 and suffix[k] != suffix[i]:
+            k = pi[k - 1]
+        if suffix[k] == suffix[i]:
+            k += 1
+        pi[i] = k
+
+    def next_len(current: int, ch: str) -> int:
+        while current > 0 and suffix[current] != ch:
+            current = pi[current - 1]
+        if current < m and suffix[current] == ch:
+            current += 1
+        return current
+
+    for state in range(m + 1):
+        for ch in gen.Sigma:
+            gen.delta[(state, ch)] = next_len(state if state < m else pi[m - 1], ch)
+
+    gen.next_state_id = m + 1
+    return ensure_total(gen)
+
+
+def build_contains_dfa(sigma: set[str], pattern: str) -> Acceptor:
+    """Accepts all words that contain the given pattern (Σ*·pattern·Σ*)."""
+    m = len(pattern)
+    gen = Acceptor()
+    gen.Q = set(range(m + 1))
+    gen.q0 = 0
+    gen.F = {m}
+    gen.Sigma = set(sigma) | set(pattern)
+    gen.delta = {}
+
+    # prefix function (KMP)
+    pi = [0] * m
+    k = 0
+    for i in range(1, m):
+        while k > 0 and pattern[k] != pattern[i]:
+            k = pi[k - 1]
+        if pattern[k] == pattern[i]:
+            k += 1
+        pi[i] = k
+
+    def next_len(current: int, ch: str) -> int:
+        while current > 0 and pattern[current] != ch:
+            current = pi[current - 1]
+        if current < m and pattern[current] == ch:
+            current += 1
+        return current
+
+    for state in range(m + 1):
+        for ch in gen.Sigma:
+            if state == m:
+                gen.delta[(state, ch)] = m  # once found, stay accepting
+            else:
+                gen.delta[(state, ch)] = next_len(state, ch)
+
+    gen.next_state_id = m + 1
+    return ensure_total(gen)
+
+
 def build_generalized_acceptor(words: list[str], generalize: bool) -> Acceptor:
     """
-    Build either the exact DEA (prefix tree + minimization) or a small generalized DEA
-    that accepts all words ending with the common last symbol (if consistent).
+    Build either the exact DEA (prefix tree + minimization) or a generalized DEA.
+    Heuristics:
+    - längster gemeinsamer Suffix (>=1): akzeptiere Σ*·Suffix
+    - längster gemeinsamer Präfix (>=1): akzeptiere Präfix·Σ*
+    - längster gemeinsamer Teilstring (>=2): akzeptiere Σ*·Teilstring·Σ*
+    - sonst: exakte Minimierung
     """
-    seen = set(ch for w in words for ch in w)
-    sigma = seen
+    sigma = {ch for w in words for ch in w}
 
     # exact model
     exact = Acceptor()
@@ -89,44 +287,74 @@ def build_generalized_acceptor(words: list[str], generalize: bool) -> Acceptor:
     exact.minimize()
     ensure_total(exact)
 
-    if not generalize or len(words) < 2:
+    if not generalize or not words:
         return exact
 
-    # simple heuristic: if all words end with the same symbol -> accept .*symbol
+    # allow generalization even mit nur einem Wort (mehr Akzeptanz)
     if any(len(w) == 0 for w in words):
         return exact
-    last_chars = {w[-1] for w in words}
-    if len(last_chars) != 1:
-        return exact
-    end_ch = next(iter(last_chars))
-    seen = set(ch for w in words for ch in w)
-    sigma = seen
 
-    gen = Acceptor()
-    gen.Q = {0, 1}
-    gen.q0 = 0
-    gen.F = {1}
-    gen.Sigma = sigma
-    gen.delta = {}
-    for s in gen.Q:
-        for ch in sigma:
-            gen.delta[(s, ch)] = 1 if ch == end_ch else 0
-    gen.next_state_id = 2 
-    ensure_total(gen)
-    return gen
+    choice = choose_generalization(words)
+    if not choice:
+        return exact
+
+    mode, token = choice
+    if mode == "suffix":
+        return build_suffix_dfa(sigma, token)
+    if mode == "prefix":
+        return build_prefix_dfa(sigma, token)
+    if mode == "contains":
+        return build_contains_dfa(sigma, token)
+
+    return exact
 
 
 def models_equal(a: Acceptor, b: Acceptor) -> bool:
     """
-    Lightweight structural equality check for two DFAs.
+    Language equivalence check for two DFAs (state ids may differ).
     """
-    return (
-        a.q0 == b.q0
-        and a.F == b.F
-        and a.Q == b.Q
-        and a.Sigma == b.Sigma
-        and a.delta == b.delta
-    )
+    sigma = a.Sigma | b.Sigma
+    # work on copies to avoid mutating originals
+    a_c = copy.deepcopy(a)
+    b_c = copy.deepcopy(b)
+    a_c.Sigma = set(sigma)
+    b_c.Sigma = set(sigma)
+    ensure_total(a_c)
+    ensure_total(b_c)
+
+    def force_dead_state(automaton: Acceptor):
+        """
+        Ensure an explicit dead state exists so delta lookups never yield None.
+        """
+        if automaton.dead_state is None:
+            dead = max(automaton.Q) + 1 if automaton.Q else 0
+            automaton.Q.add(dead)
+            automaton.dead_state = dead
+            automaton.next_state_id = max(automaton.next_state_id, dead + 1)
+            for ch in automaton.Sigma:
+                automaton.delta[(dead, ch)] = dead
+        # also fill any remaining gaps to the dead state
+        for s in list(automaton.Q):
+            for ch in automaton.Sigma:
+                automaton.delta.setdefault((s, ch), automaton.dead_state)
+
+    force_dead_state(a_c)
+    force_dead_state(b_c)
+
+    seen = set()
+    queue = deque([(a_c.q0, b_c.q0)])
+    while queue:
+        s1, s2 = queue.popleft()
+        if (s1, s2) in seen:
+            continue
+        seen.add((s1, s2))
+        if (s1 in a_c.F) != (s2 in b_c.F):
+            return False
+        for ch in sigma:
+            t1 = a_c.delta.get((s1, ch), a_c.dead_state)
+            t2 = b_c.delta.get((s2, ch), b_c.dead_state)
+            queue.append((t1, t2))
+    return True
 
 
 def ensure_total(automaton: Acceptor) -> Acceptor:
@@ -177,12 +405,15 @@ with col_btn:
     run_training = st.button("Lernen & minimieren")
 with col_chk:
     generalize = st.checkbox(
-        
-        "Heuristische Verallgemeinerung", #(wenn alle Wörter auf dasselbe Zeichen enden)
+        "Heuristische Verallgemeinerung",
         value=st.session_state.get("generalize_toggle", True),
         key="generalize_toggle",
         on_change=lambda: st.session_state.update({"generalize_toggle_changed": True}),
     )
+    st.caption("Heuristik: längster gemeinsamer Suffix → Σ*·Suffix, "
+           "sonst längster gemeinsamer Präfix → Präfix·Σ*, "
+           "sonst längster gemeinsamer Teilstring → Σ*·Teilstring·Σ*, "
+           "sonst exakte Minimierung.")
 
 # --- Session State ------------------------------------------------------------
 if "snapshots" not in st.session_state:
@@ -223,6 +454,7 @@ if recompute:
                     dead_incoming = any(
                         s != dead and t == dead for (s, ch), t in learner.delta.items()
                     )
+                lang_desc, lang_examples, lang_mode = describe_language(words[:idx], generalize)
                 snapshots.append(
                     {
                         "step": idx,
@@ -236,6 +468,10 @@ if recompute:
                         "transitions": transitions,
                         "trace": trace_lines,
                         "accepted": accepted,
+                        "language": lang_desc,
+                        "lang_mode": lang_mode,
+                        "examples": lang_examples,
+                        "generalize": generalize,
                         "prev_accepts": prev_accepts,
                         "changed": changed,
                         "prev_states": prev_states,
@@ -313,14 +549,29 @@ if snapshots:
         st.code("\n".join(snap["trace"]), language="text")
     with col_sig:
         observed_words = st.session_state.get("training_words", [])[:step]
-        lang_str = "; ".join(observed_words) if observed_words else "∅"
+        lang_desc = snap.get("language", "∅")
+        example_str = snap.get("examples", "")
         st.markdown("**Formale Signatur**")
-        st.write(f"L(V) = {{{lang_str}}}")
+        if observed_words:
+            st.write(f"V_{step} = {{{'; '.join(observed_words)}}}")
+        else:
+            st.write("V = ∅")
+        if example_str:
+            st.caption(f"Beispiele: {example_str}")
         st.write(f"𝔄 = (Σ, Z, δ, F, z₀)")
         st.write(f"Σ = {{{', '.join(snap['alphabet'])}}}")
         st.write(f"Z = {{{', '.join(snap['states'])}}}")
         st.write(f"F = {{{', '.join(snap['accepting'])}}}")
         st.write(f"z₀ = {snap['start']}")
+        mode = snap.get("lang_mode")
+        if mode == "suffix":
+            st.caption("Hinweis: Generalisierung über gemeinsamen Suffix ⇒ akzeptiert ggf. mehr als V.")
+        elif mode == "prefix":
+            st.caption("Hinweis: Generalisierung über gemeinsamen Präfix ⇒ akzeptiert ggf. mehr als V.")
+        elif mode == "contains":
+            st.caption("Hinweis: Generalisierung über gemeinsamen Teilstring ⇒ akzeptiert ggf. mehr als V.")
+        elif mode == "exact":
+            st.caption("Exakte Hypothese über die bisherigen Wörter.")
 
 # --- Tests --------------------------------------------------------------------
 st.subheader("Testen")

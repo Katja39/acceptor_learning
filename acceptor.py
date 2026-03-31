@@ -43,14 +43,16 @@ class Acceptor:
             state = self.delta[(state, ch)]
         return state in self.F
 
-    def minimize(self):
+    def minimize(self, make_total=True):
         """
         Minimizes the automaton to a minimal DFA.
-        The automaton is first made total (dead state added),
-        then minimized using Hopcroft's algorithm.
+        Optionally make the automaton total (dead state added)
+        before Hopcroft's algorithm. Skipping totalization keeps
+        partial DFAs minimal without forcing a dead state.
         """
-        # 1. Make the automaton total (add dead state if needed)
-        self._make_total()
+        # 1. Optionally make the automaton total (add dead state if needed)
+        if make_total:
+            self._make_total()
 
         # 2. Hopcroft partition refinement
         partitions = self._hopcroft_partitions()
@@ -61,23 +63,29 @@ class Acceptor:
         # 4. Remove unreachable states (optional but clean)
         self._remove_unreachable()
 
+        # 5. Keep state-id generator in sync with renumbered states
+        self.next_state_id = (max(self.Q) + 1) if self.Q else 0
+
     def _make_total(self):
         """
         Adds a dead state and defines all missing transitions.
         The dead state is non-accepting and loops to itself for all symbols.
         """
+        # Prefer reusing an explicitly tracked dead state if it is still valid,
+        # otherwise create a fresh one to avoid misclassifying real states.
         dead = None
-        for s in self.Q:
-            if s not in self.F:
-                all_self = True
-                for ch in self.Sigma:
-                    if (s, ch) not in self.delta or self.delta[(s, ch)] != s:
-                        all_self = False
-                        break
-                if all_self:
-                    dead = s
-                    break
-        if dead is None:
+        if (
+            self.dead_state is not None
+            and self.dead_state in self.Q
+            and self.dead_state not in self.F
+            and all(
+                (self.dead_state, ch) in self.delta
+                and self.delta[(self.dead_state, ch)] == self.dead_state
+                for ch in self.Sigma
+            )
+        ):
+            dead = self.dead_state
+        else:
             dead = self.next_state_id
             self.Q.add(dead)
             self.next_state_id += 1
@@ -199,4 +207,3 @@ class Acceptor:
                         new_partitions.append(Y)
                 partitions = new_partitions
         return partitions
-
